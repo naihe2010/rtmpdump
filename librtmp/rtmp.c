@@ -1557,7 +1557,7 @@ WriteN(RTMP *r, const char *buffer, int n)
   return n == 0;
 }
 
-#define SAVC(x)	static const AVal av_##x = AVC(#x)
+#define SAVC(x)	static const AVal av_## x = AVC(#x)
 
 SAVC(app);
 SAVC(connect);
@@ -5099,35 +5099,69 @@ int
 RTMP_Write(RTMP *r, const char *buf, int size)
 {
   RTMPPacket *pkt = &r->m_write;
-  char *pend, *enc;
-  int s2 = size, ret, num;
+  char *pend, *enc, *header;
+  int s2 = size, ret, num, need, length;
 
   pkt->m_nChannel = 0x04;	/* source channel */
   pkt->m_nInfoField2 = r->m_stream_id;
 
+  if (r->last_truncate)
+    {
+      if (size < r->last_truncate)
+        {
+          r->last_truncate -= size;
+          return 0;
+        }
+
+      buf += r->last_truncate;
+      size -= r->last_truncate;
+      r->last_truncate = 0;
+    }
+
   while (s2)
     {
       if (!pkt->m_nBytesRead)
-	{
-	  if (size < 11) {
-	    /* FLV pkt too small */
-	    return 0;
-	  }
+        {
+          if (r->cache_len < 13)
+            {
+              need = 13 - r->cache_len;
+              if (s2 < need)
+                {
+                  memcpy(r->cache + r->cache_len, buf, s2);
+                  r->cache_len += s2;
+                  return size;
+                }
 
-	  if (buf[0] == 'F' && buf[1] == 'L' && buf[2] == 'V')
-	    {
-	      buf += 13;
-	      s2 -= 13;
-	    }
+              memcpy(r->cache + r->cache_len, buf, need);
+              r->cache_len += need;
+              buf += need;
+              s2 -= need;
+            }
 
-	  pkt->m_packetType = *buf++;
-	  pkt->m_nBodySize = AMF_DecodeInt24(buf);
-	  buf += 3;
-	  pkt->m_nTimeStamp = AMF_DecodeInt24(buf);
-	  buf += 3;
-	  pkt->m_nTimeStamp |= *buf++ << 24;
-	  buf += 3;
-	  s2 -= 11;
+          if (r->cache[0] == 'F' && r->cache[1] == 'L' && r->cache[2] == 'V')
+            {
+              if (s2 < 13)
+                {
+                  memcpy(r->cache, buf, s2);
+                  r->cache_len = s2;
+                  return size;
+                }
+
+              memcpy(r->cache, buf, 13);
+              r->cache_len = 13;
+              buf += 13;
+              s2 -= 13;
+            }
+
+          r->cache_len = 0;
+          header = r->cache;
+          pkt->m_packetType = *header++;
+          pkt->m_nBodySize = AMF_DecodeInt24(header);
+          header += 3;
+          pkt->m_nTimeStamp = AMF_DecodeInt24(header);
+          header += 3;
+          pkt->m_nTimeStamp |= *header++ << 24;
+          header += 3;
 
 	  if (((pkt->m_packetType == RTMP_PACKET_TYPE_AUDIO
                 || pkt->m_packetType == RTMP_PACKET_TYPE_VIDEO) &&
@@ -5142,19 +5176,26 @@ RTMP_Write(RTMP *r, const char *buf, int size)
 	      pkt->m_headerType = RTMP_PACKET_SIZE_MEDIUM;
 	    }
 
-	  if (!RTMPPacket_Alloc(pkt, pkt->m_nBodySize))
-	    {
-	      RTMP_Log(RTMP_LOGDEBUG, "%s, failed to allocate packet", __FUNCTION__);
-	      return FALSE;
-	    }
-	  enc = pkt->m_body;
-	  pend = enc + pkt->m_nBodySize;
-	  if (pkt->m_packetType == RTMP_PACKET_TYPE_INFO)
-	    {
-	      enc = AMF_EncodeString(enc, pend, &av_setDataFrame);
-	      pkt->m_nBytesRead = enc - pkt->m_body;
-	    }
-	}
+          if (!RTMPPacket_Alloc(pkt, pkt->m_nBodySize))
+            {
+              RTMP_Log(RTMP_LOGDEBUG, "%s, failed to allocate packet",
+                       __FUNCTION__);
+              return -1;
+            }
+          enc = pkt->m_body;
+          pend = enc + pkt->m_nBodySize;
+          if (pkt->m_packetType == RTMP_PACKET_TYPE_INFO)
+            {
+              enc = AMF_EncodeString(enc, pend, &av_setDataFrame);
+              pkt->m_nBytesRead = enc - pkt->m_body;
+            }
+
+          *enc = r->cache[11];
+          enc++;
+          *enc = r->cache[12];
+          enc++;
+          pkt->m_nBytesRead += 2;
+        }
       else
 	{
 	  enc = pkt->m_body + pkt->m_nBytesRead;
@@ -5167,17 +5208,41 @@ RTMP_Write(RTMP *r, const char *buf, int size)
       s2 -= num;
       buf += num;
       if (pkt->m_nBytesRead == pkt->m_nBodySize)
-	{
-	  ret = RTMP_SendPacket(r, pkt, FALSE);
-	  RTMPPacket_Free(pkt);
-	  pkt->m_nBytesRead = 0;
-	  if (!ret)
-	    return -1;
-	  buf += 4;
-	  s2 -= 4;
-	  if (s2 < 0)
-	    break;
-	}
+        {
+          if (s2 >= 4)
+            {
+              int blength = pkt->m_nBodySize;
+              if (pkt->m_packetType == RTMP_PACKET_TYPE_INFO)
+                blength -= 16;
+              length = AMF_DecodeInt32(buf);
+              if (blength + 11 != length)
+                {
+                  RTMP_Log(RTMP_LOGERROR, "maybe error packet: %d:%d\n",
+                           pkt->m_packetType, pkt->m_nBodySize);
+                  RTMPPacket_Free(pkt);
+                  return -1;
+                }
+            }
+
+          RTMP_Log(RTMP_LOGDEBUG, "send packet: %d:%d\n", pkt->m_packetType,
+                   pkt->m_nBodySize);
+          ret = RTMP_SendPacket(r, pkt, FALSE);
+          RTMPPacket_Free(pkt);
+          pkt->m_nBytesRead = 0;
+          if (!ret)
+            return -1;
+          if (s2 >= 4)
+            {
+              buf += 4;
+              s2 -= 4;
+            }
+          else
+            {
+              r->last_truncate = 4 - s2;
+              return size;
+            }
+        }
     }
-  return size+s2;
+
+  return size;
 }
